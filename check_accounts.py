@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Free Fire Fast Bulk Account Ban & Status Checker (OB55)
+Free Fire Ultra-Fast Bulk Account Ban & Status Checker (OB55)
 Author: batz-dev
 
 Features:
 - Live streaming output (prints results immediately as each account completes)
-- High-concurrency async checking (20+ parallel workers)
-- Accurate in-game anti-cheat Ban detection (Field 13: Reason & Expiry date)
-- In-game UID & Server Region detection for Active accounts
+- Highly reliable async concurrency with automatic 3x network retry & backoff
+- Generates dynamic unique device fingerprints per account to prevent Garena rate-limiting
+- Prioritized Active vs Banned detection (accurate In-Game UID & Region for Active, Ban Reason for Banned)
 - Auto-exports: check_results.json, active_accounts.txt, banned_accounts.txt
 """
 
@@ -15,6 +15,8 @@ import sys
 import os
 import json
 import asyncio
+import uuid
+import random
 from datetime import datetime, timezone
 import httpx
 from Crypto.Cipher import AES
@@ -52,7 +54,9 @@ def encode_proto_field(tag: int, val) -> bytes:
         return header + encode_varint(len(val)) + val
     return b''
 
-def build_payload(open_id: str, access_token: str) -> bytes:
+def build_payload(open_id: str, access_token: str, device_id: str = None) -> bytes:
+    dev = device_id or f"Google|{uuid.uuid4()}"
+    ip = f"{random.randint(100, 220)}.{random.randint(10, 200)}.{random.randint(10, 200)}.{random.randint(10, 200)}"
     fields = {
         3: str(datetime.now())[:-7],
         4: "free fire",
@@ -69,8 +73,8 @@ def build_payload(open_id: str, access_token: str) -> bytes:
         16: 2799,
         17: "PowerVR Rogue GE8320",
         18: "OpenGL ES 3.2 build 1.11@5425693",
-        19: "Google|9f7d6b8b-b10c-454a-852d-06332cd498eb",
-        20: "151.158.158.220",
+        19: dev,
+        20: ip,
         21: "en",
         22: open_id,
         23: "4",
@@ -177,6 +181,10 @@ def decode_proto(data: bytes) -> dict:
     return fields
 
 def parse_login_response(content: bytes):
+    if len(content) < 40:
+        return "LOGIN_FAILED", "-", "-", "Empty or invalid response"
+
+    # PRIORITY 1: Check for ACTIVE account across all valid offsets
     for offset in [64, 0] + list(range(1, 128)):
         if len(content) <= offset:
             continue
@@ -184,26 +192,26 @@ def parse_login_response(content: bytes):
         if not fields:
             continue
 
-        # 1. Ban detection in Field 13 (Garena direct anti-cheat server ban)
-        if 13 in fields:
-            sub = decode_proto(fields[13])
-            reason = sub.get(4, b'').decode(errors='ignore') if isinstance(sub.get(4), (bytes, bytearray)) else str(sub.get(4, ''))
-            ts = sub.get(3, 0)
-            details = f"Reason: {reason}" if reason else "Banned by Garena"
-            if ts:
-                try:
-                    dt = datetime.fromtimestamp(ts, timezone.utc)
-                    details += f" (Expiry: {dt.strftime('%Y-%m-%d %H:%M:%S UTC')})"
-                except Exception:
-                    pass
-            return "BANNED", "-", "-", details
-
-        # 2. Active account: Field 1 (Ingame UID) & Field 2 (Region)
-        if 1 in fields and 2 in fields:
+        # Active account MUST have In-Game UID (tag 1), Region (tag 2), and Token (tag 8)
+        if 1 in fields and 2 in fields and 8 in fields:
             uid_val = str(fields[1])
             reg_val = fields[2].decode(errors='ignore') if isinstance(fields[2], (bytes, bytearray)) else str(fields[2])
-            if uid_val.isdigit():
+            if uid_val.isdigit() and int(uid_val) > 0 and len(reg_val) in (2, 3, 4):
                 return "ACTIVE", uid_val, reg_val, ""
+
+    # PRIORITY 2: Check for BANNED account (only when NOT active and packet is small ban record)
+    for offset in [64, 0] + list(range(1, 128)):
+        if len(content) <= offset:
+            continue
+        fields = decode_proto(content[offset:])
+        if not fields:
+            continue
+
+        if 13 in fields and len(content) < 500:
+            sub = decode_proto(fields[13])
+            reason = sub.get(4, b'').decode(errors='ignore') if isinstance(sub.get(4), (bytes, bytearray)) else str(sub.get(4, ''))
+            details = f"Reason: {reason}" if reason else "Banned by Garena"
+            return "BANNED", "-", "-", details
 
     return "UNKNOWN", "-", "-", ""
 
@@ -218,7 +226,7 @@ async def check_account(client: httpx.AsyncClient, uid: str, password: str, sema
             "details": ""
         }
 
-        # 1. Garena OAuth Grant
+        # 1. Garena OAuth Grant with up to 3 retries
         oauth_url = "https://100067.connect.garena.com/oauth/guest/token/grant"
         oauth_headers = {
             "Host": "100067.connect.garena.com",
@@ -234,17 +242,25 @@ async def check_account(client: httpx.AsyncClient, uid: str, password: str, sema
             "client_id": "100067"
         }
 
-        try:
-            r = await client.post(oauth_url, headers=oauth_headers, data=oauth_data, timeout=12)
-            res_json = r.json()
-        except Exception as e:
-            result["status"] = "NETWORK_ERROR"
-            result["details"] = str(e)
-            return result
+        res_json = None
+        for attempt in range(3):
+            try:
+                r = await client.post(oauth_url, headers=oauth_headers, data=oauth_data, timeout=12)
+                if r.status_code == 429:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                res_json = r.json()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    result["status"] = "NETWORK_ERROR"
+                    result["details"] = f"Timeout/Disconnect ({str(e)})"
+                    return result
+                await asyncio.sleep(0.8 * (attempt + 1))
 
-        if "error" in res_json or not res_json.get("access_token"):
+        if not res_json or "error" in res_json or not res_json.get("access_token"):
             result["status"] = "INVALID_CREDENTIALS"
-            result["details"] = res_json.get("error", "Wrong UID or Password")
+            result["details"] = res_json.get("error", "Wrong UID or Password") if res_json else "No response"
             return result
 
         open_id = res_json["open_id"]
@@ -264,26 +280,33 @@ async def check_account(client: httpx.AsyncClient, uid: str, password: str, sema
             "X-Unity-Version": "2018.4.12f1"
         }
 
-        payload = build_payload(open_id, access_token)
-        try:
-            r_login = await client.post(login_url, headers=login_headers, content=payload, timeout=12)
-            if r_login.status_code == 200:
-                status, ingame_uid, region, details = parse_login_response(r_login.content)
-                result["status"] = status
-                result["ingame_uid"] = ingame_uid
-                result["region"] = region
-                result["details"] = details
-            else:
-                err_text = r_login.text.strip()
-                if "BANNED" in err_text:
-                    result["status"] = "BANNED"
-                    result["details"] = err_text
+        dev_id = f"Google|{uuid.uuid4()}"
+        payload = build_payload(open_id, access_token, dev_id)
+
+        for attempt in range(3):
+            try:
+                r_login = await client.post(login_url, headers=login_headers, content=payload, timeout=12)
+                if r_login.status_code == 200:
+                    status, ingame_uid, region, details = parse_login_response(r_login.content)
+                    result["status"] = status
+                    result["ingame_uid"] = ingame_uid
+                    result["region"] = region
+                    result["details"] = details
                 else:
-                    result["status"] = "LOGIN_FAILED"
-                    result["details"] = err_text
-        except Exception as e:
-            result["status"] = "NETWORK_ERROR"
-            result["details"] = str(e)
+                    err_text = r_login.text.strip()
+                    if "BANNED" in err_text:
+                        result["status"] = "BANNED"
+                        result["details"] = err_text
+                    else:
+                        result["status"] = "LOGIN_FAILED"
+                        result["details"] = err_text
+                break
+            except Exception as e:
+                if attempt == 2:
+                    result["status"] = "NETWORK_ERROR"
+                    result["details"] = f"MajorLogin error ({str(e)})"
+                    return result
+                await asyncio.sleep(0.8 * (attempt + 1))
 
         return result
 
@@ -346,15 +369,16 @@ async def main():
 
     total = len(accounts)
     print(f"{GREEN}[+] Loaded {total} accounts from {file_path}{RESET}")
-    print(f"{CYAN}[i] Starting live checking with parallel workers...{RESET}\n")
+    print(f"{CYAN}[i] Starting live checking with parallel workers (anti-rate-limit protected)...{RESET}\n")
 
     print(f"{BOLD}{'-' * 88}{RESET}")
     print(f"{BOLD}{'#':<6} | {'GUEST UID':<14} | {'INGAME UID':<14} | {'REGION':<7} | {'STATUS':<12} | {'DETAILS'}{RESET}")
     print(f"{BOLD}{'-' * 88}{RESET}")
 
-    concurrency = min(25, max(5, total))
+    # Optimal concurrency to prevent Garena connection drops (5-8 workers)
+    concurrency = min(8, max(3, total))
     semaphore = asyncio.Semaphore(concurrency)
-    limits = httpx.Limits(max_connections=concurrency * 2, max_keepalive_connections=concurrency)
+    limits = httpx.Limits(max_connections=concurrency * 3, max_keepalive_connections=concurrency)
     client = httpx.AsyncClient(verify=False, timeout=15, limits=limits)
 
     completed_count = 0
