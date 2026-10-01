@@ -58,19 +58,19 @@ def build_payload(open_id: str, access_token: str, device_id: str = None) -> byt
     dev = device_id or f"Google|{uuid.uuid4()}"
     ip = f"{random.randint(100, 220)}.{random.randint(10, 200)}.{random.randint(10, 200)}.{random.randint(10, 200)}"
     fields = {
-        3: str(datetime.now())[:-7],
+        3: str(int(datetime.now(timezone.utc).timestamp())),
         4: "free fire",
         5: 1,
-        7: "2.133.9",
-        8: "Android OS 10 / API-29 (QP1A.190711.020/1617006012)",
+        7: "1.132.1",
+        8: "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)",
         9: "Handheld",
-        10: "Vi India",
+        10: "JIO",
         11: "WIFI",
         12: 1600,
         13: 720,
         14: "320",
-        15: "ARM64 FP ASIMD AES | 2301 | 8",
-        16: 2799,
+        15: "ARMv7 VFPv3 NEON | 2001 | 8",
+        16: 3790,
         17: "PowerVR Rogue GE8320",
         18: "OpenGL ES 3.2 build 1.11@5425693",
         19: dev,
@@ -79,45 +79,46 @@ def build_payload(open_id: str, access_token: str, device_id: str = None) -> byt
         22: open_id,
         23: "4",
         24: "Handheld",
-        25: "realme RMX2189",
-        26: "SG",
+        25: "Redmi 1908034TI",
+        26: "IN",
         29: access_token,
         30: 1,
-        41: "Vi India",
+        41: "JIO",
         42: "WIFI",
         57: "1ac4b80ecf0478a44203bf8fac6120f5",
-        60: 19799,
-        61: 2536,
-        62: 5056,
-        64: 2768,
-        65: 19999,
-        66: 2536,
-        67: 19799,
-        73: 1,
-        74: "/data/app/com.dts.freefiremax-ShI7E0dK8p1IiZ785pvuVQ==/lib/arm64",
-        76: 2,
-        77: "38f4751a330688ab124c2c804cec90a5|/data/app/com.dts.freefiremax-ShI7E0dK8p1IiZ785pvuVQ==/base.apk",
-        78: 2,
-        79: 2,
-        81: "64",
-        83: "2019118527",
-        86: "OpenGLES3",
+        60: 53041,
+        61: 7291,
+        62: 2176,
+        64: 7395,
+        65: 53041,
+        66: 7395,
+        67: 53041,
+        70: 4,
+        73: 2,
+        74: "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm",
+        76: 1,
+        77: "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk",
+        78: 6,
+        79: 1,
+        81: "32",
+        83: "2019121227",
+        85: 3,
+        86: "OpenGLES2",
         87: 3071,
         88: 4,
-        92: 67920,
-        93: "android_max",
-        94: "KqsHT+UrR1HKqb6+1db+Ofei+NtZr2+hbiBo3yKDL8w+8E3S5qF2IgEEe1fFQFyHRzl4iyHjHp+QsfeLbjJ6+DidTiKxm0ak2uYYa6QR4nAUdlZR",
-        95: 111107,
-        96: '{"cur_rate":null,"support_etc2":true}',
+        92: 9329,
+        93: "3rd_party",
+        94: "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug=",
+        95: 111207,
+        96: '{"cur_rate":null,"support_etc2":false}',
         97: 1,
-        98: 1,
         99: "4",
         100: "4",
-        102: "",
-        104: 83812,
+        102: b"BTL\x10S\x0e[\x040",
+        104: 47591,
         105: 1,
-        106: "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|a4332cb1c1a84e51dd77441e4856ed5a",
-        107: "1.9393e7b8e53e8aeb"
+        106: "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b",
+        107: "c8e41b7a93f02d56e1a94c7b8203f5d1"
     }
     raw = bytearray()
     for tag in sorted(fields.keys()):
@@ -192,14 +193,14 @@ def parse_login_response(content: bytes):
         if not fields:
             continue
 
-        # Active account MUST have In-Game UID (tag 1), Region (tag 2), and Token (tag 8)
-        if 1 in fields and 2 in fields and 8 in fields:
+        # Active account MUST have In-Game UID (tag 1) and Region (tag 2)
+        if 1 in fields and 2 in fields:
             uid_val = str(fields[1])
             reg_val = fields[2].decode(errors='ignore') if isinstance(fields[2], (bytes, bytearray)) else str(fields[2])
             if uid_val.isdigit() and int(uid_val) > 0 and len(reg_val) in (2, 3, 4):
                 return "ACTIVE", uid_val, reg_val, ""
 
-    # PRIORITY 2: Check for BANNED account (only when NOT active and packet is small ban record)
+    # PRIORITY 2: Check for BANNED account
     for offset in [64, 0] + list(range(1, 128)):
         if len(content) <= offset:
             continue
@@ -207,10 +208,17 @@ def parse_login_response(content: bytes):
         if not fields:
             continue
 
-        if 13 in fields and len(content) < 500:
+        if 13 in fields:
             sub = decode_proto(fields[13])
             reason = sub.get(4, b'').decode(errors='ignore') if isinstance(sub.get(4), (bytes, bytearray)) else str(sub.get(4, ''))
-            details = f"Reason: {reason}" if reason else "Banned by Garena"
+            ts = sub.get(3)
+            date_str = ""
+            if ts and isinstance(ts, int):
+                try:
+                    date_str = f" (at {datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')})"
+                except Exception:
+                    pass
+            details = f"Reason: {reason}{date_str}" if reason else "Banned by Garena"
             return "BANNED", "-", "-", details
 
     return "UNKNOWN", "-", "-", ""
