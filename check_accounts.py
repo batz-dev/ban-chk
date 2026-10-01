@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Free Fire Bulk Account Ban & Status Checker (OB55)
+Free Fire Fast Bulk Account Ban & Status Checker (OB55)
 Author: batz-dev
 
-Checks Guest UID:Password accounts in bulk:
-- Authenticates with Garena OAuth
-- Resolves In-Game UID & Server Region via OB55 MajorLogin
-- Cross-references Garena Anti-Hack API for Ban status & duration
-- Supports JSON (dict, list) and plain text lines
-- Fast asynchronous concurrent execution
+Features:
+- Live streaming output (prints results immediately as each account completes)
+- High-concurrency async checking (20+ parallel workers)
+- Accurate in-game anti-cheat Ban detection (Field 13: Reason & Expiry date)
+- In-game UID & Server Region detection for Active accounts
+- Auto-exports: check_results.json, active_accounts.txt, banned_accounts.txt
 """
 
 import sys
 import os
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-# Terminal Colors
+# ANSI Colors
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -121,77 +121,97 @@ def build_payload(open_id: str, access_token: str) -> bytes:
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
     return cipher.encrypt(pad(bytes(raw), AES.block_size))
 
-def parse_proto_response(response_bytes: bytes):
-    """Zero-dependency protobuf decoder for MajorLoginRes."""
-    for offset in [64, 0] + list(range(1, 128)):
-        if len(response_bytes) <= offset:
-            continue
-        data = response_bytes[offset:]
-        fields = {}
-        i = 0
-        try:
-            while i < len(data):
-                key = 0
-                shift = 0
-                while True:
-                    if i >= len(data):
-                        break
-                    b = data[i]
-                    i += 1
-                    key |= (b & 0x7F) << shift
-                    if (b & 0x80) == 0:
-                        break
-                    shift += 7
-                tag = key >> 3
-                wire = key & 7
-                if wire == 0:  # varint
-                    v = 0
-                    shift = 0
-                    while True:
-                        if i >= len(data):
-                            break
-                        b = data[i]
-                        i += 1
-                        v |= (b & 0x7F) << shift
-                        if (b & 0x80) == 0:
-                            break
-                        shift += 7
-                    fields[tag] = v
-                elif wire == 2:  # length-delimited
-                    v_len = 0
-                    shift = 0
-                    while True:
-                        if i >= len(data):
-                            break
-                        b = data[i]
-                        i += 1
-                        v_len |= (b & 0x7F) << shift
-                        if (b & 0x80) == 0:
-                            break
-                        shift += 7
-                    val = data[i:i + v_len]
-                    i += v_len
-                    fields[tag] = val
-                elif wire == 1:
-                    i += 8
-                elif wire == 5:
-                    i += 4
-                else:
+def decode_proto(data: bytes) -> dict:
+    fields = {}
+    i = 0
+    blen = len(data)
+    while i < blen:
+        key = 0
+        shift = 0
+        while True:
+            if i >= blen:
+                return fields
+            b = data[i]
+            i += 1
+            key |= (b & 0x7F) << shift
+            if (b & 0x80) == 0:
+                break
+            shift += 7
+        tag = key >> 3
+        wire = key & 7
+        if wire == 0:  # varint
+            v = 0
+            shift = 0
+            while True:
+                if i >= blen:
+                    return fields
+                b = data[i]
+                i += 1
+                v |= (b & 0x7F) << shift
+                if (b & 0x80) == 0:
                     break
+                shift += 7
+            fields[tag] = v
+        elif wire == 2:  # length-delimited
+            v_len = 0
+            shift = 0
+            while True:
+                if i >= blen:
+                    return fields
+                b = data[i]
+                i += 1
+                v_len |= (b & 0x7F) << shift
+                if (b & 0x80) == 0:
+                    break
+                shift += 7
+            if i + v_len > blen:
+                return fields
+            fields[tag] = data[i:i + v_len]
+            i += v_len
+        elif wire == 1:
+            i += 8
+        elif wire == 5:
+            i += 4
+        else:
+            break
+    return fields
 
-            if 1 in fields and 2 in fields:
-                uid_val = str(fields[1])
-                reg_val = fields[2].decode(errors='ignore')
-                if uid_val.isdigit() and len(reg_val) in (2, 3, 4):
-                    return uid_val, reg_val
-        except Exception:
-            pass
-    return "-", "-"
+def parse_login_response(content: bytes):
+    for offset in [64, 0] + list(range(1, 128)):
+        if len(content) <= offset:
+            continue
+        fields = decode_proto(content[offset:])
+        if not fields:
+            continue
+
+        # 1. Ban detection in Field 13 (Garena direct anti-cheat server ban)
+        if 13 in fields:
+            sub = decode_proto(fields[13])
+            reason = sub.get(4, b'').decode(errors='ignore') if isinstance(sub.get(4), (bytes, bytearray)) else str(sub.get(4, ''))
+            ts = sub.get(3, 0)
+            details = f"Reason: {reason}" if reason else "Banned by Garena"
+            if ts:
+                try:
+                    dt = datetime.fromtimestamp(ts, timezone.utc)
+                    details += f" (Expiry: {dt.strftime('%Y-%m-%d %H:%M:%S UTC')})"
+                except Exception:
+                    pass
+            return "BANNED", "-", "-", details
+
+        # 2. Active account: Field 1 (Ingame UID) & Field 2 (Region)
+        if 1 in fields and 2 in fields:
+            uid_val = str(fields[1])
+            reg_val = fields[2].decode(errors='ignore') if isinstance(fields[2], (bytes, bytearray)) else str(fields[2])
+            if uid_val.isdigit():
+                return "ACTIVE", uid_val, reg_val, ""
+
+    return "UNKNOWN", "-", "-", ""
 
 async def check_account(client: httpx.AsyncClient, uid: str, password: str, semaphore: asyncio.Semaphore) -> dict:
     async with semaphore:
         result = {
             "guest_uid": uid,
+            "password": password,
             "status": "UNKNOWN",
             "ingame_uid": "-",
             "region": "-",
@@ -230,7 +250,7 @@ async def check_account(client: httpx.AsyncClient, uid: str, password: str, sema
         open_id = res_json["open_id"]
         access_token = res_json["access_token"]
 
-        # 2. MajorLogin to resolve Ingame UID & Region
+        # 2. MajorLogin Authentication & Status Check
         login_url = "https://loginbp.ppmainecoonghj.com/MajorLogin"
         login_headers = {
             "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-TANBIR)",
@@ -248,43 +268,22 @@ async def check_account(client: httpx.AsyncClient, uid: str, password: str, sema
         try:
             r_login = await client.post(login_url, headers=login_headers, content=payload, timeout=12)
             if r_login.status_code == 200:
-                ingame_uid, region = parse_proto_response(r_login.content)
+                status, ingame_uid, region, details = parse_login_response(r_login.content)
+                result["status"] = status
                 result["ingame_uid"] = ingame_uid
                 result["region"] = region
+                result["details"] = details
             else:
                 err_text = r_login.text.strip()
                 if "BANNED" in err_text:
                     result["status"] = "BANNED"
                     result["details"] = err_text
-                    return result
-        except Exception:
-            pass
-
-        # 3. Garena Official Anti-Hack Verification
-        target_uid = result["ingame_uid"] if result["ingame_uid"] != "-" else uid
-        antihack_url = f"https://ff.garena.com/api/antihack/check_banned?lang=en&uid={target_uid}"
-        antihack_headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10)",
-            "Accept": "application/json",
-            "referer": "https://ff.garena.com/en/support/",
-            "x-requested-with": "B6FksShzIgjfrYImLpTsadjS86sddhFH"
-        }
-
-        try:
-            r_ban = await client.get(antihack_url, headers=antihack_headers, timeout=10)
-            if r_ban.status_code == 200:
-                ban_data = r_ban.json().get("data", {})
-                is_banned = ban_data.get("is_banned", 0)
-                period = ban_data.get("period", 0)
-                if is_banned == 1:
-                    result["status"] = "BANNED"
-                    result["details"] = f"Duration: {period} hours" if period > 0 else "Permanent Ban"
                 else:
-                    result["status"] = "ACTIVE"
-            else:
-                result["status"] = "ACTIVE"
-        except Exception:
-            result["status"] = "ACTIVE"
+                    result["status"] = "LOGIN_FAILED"
+                    result["details"] = err_text
+        except Exception as e:
+            result["status"] = "NETWORK_ERROR"
+            result["details"] = str(e)
 
         return result
 
@@ -297,7 +296,6 @@ def load_accounts_from_file(file_path: str) -> list:
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read().strip()
-            # Try JSON first
             try:
                 data = json.loads(content)
                 if isinstance(data, dict):
@@ -317,7 +315,6 @@ def load_accounts_from_file(file_path: str) -> list:
                                 u, p = list(item.items())[0]
                                 accounts.append((str(u).strip(), str(p).strip()))
             except json.JSONDecodeError:
-                # Text lines: uid:pass
                 for line in content.splitlines():
                     line = line.strip()
                     if line and ":" in line and not line.startswith("#"):
@@ -330,7 +327,7 @@ def load_accounts_from_file(file_path: str) -> list:
 
 async def main():
     print(f"\n{BOLD}{CYAN}========================================================================{RESET}")
-    print(f"{BOLD}{CYAN}          FREE FIRE BULK ACCOUNT BAN & STATUS CHECKER (OB55)           {RESET}")
+    print(f"{BOLD}{CYAN}      FREE FIRE ULTRA-FAST LIVE BAN & STATUS CHECKER (OB55)           {RESET}")
     print(f"{BOLD}{CYAN}========================================================================{RESET}\n")
 
     if len(sys.argv) > 1:
@@ -347,47 +344,78 @@ async def main():
         print(f"{RED}[!] No valid uid:pass pairs found in {file_path}.{RESET}")
         return
 
-    print(f"{GREEN}[+] Loaded {len(accounts)} accounts from {file_path}{RESET}")
-    print(f"{CYAN}[i] Checking accounts concurrently... please wait.{RESET}\n")
+    total = len(accounts)
+    print(f"{GREEN}[+] Loaded {total} accounts from {file_path}{RESET}")
+    print(f"{CYAN}[i] Starting live checking with parallel workers...{RESET}\n")
 
-    semaphore = asyncio.Semaphore(5)
-    client = httpx.AsyncClient(verify=False, timeout=15)
+    print(f"{BOLD}{'-' * 88}{RESET}")
+    print(f"{BOLD}{'#':<6} | {'GUEST UID':<14} | {'INGAME UID':<14} | {'REGION':<7} | {'STATUS':<12} | {'DETAILS'}{RESET}")
+    print(f"{BOLD}{'-' * 88}{RESET}")
 
-    tasks = [check_account(client, u, p, semaphore) for u, p in accounts]
-    results = await asyncio.gather(*tasks)
-    await client.aclose()
+    concurrency = min(25, max(5, total))
+    semaphore = asyncio.Semaphore(concurrency)
+    limits = httpx.Limits(max_connections=concurrency * 2, max_keepalive_connections=concurrency)
+    client = httpx.AsyncClient(verify=False, timeout=15, limits=limits)
 
-    # Results Table
-    print(f"{BOLD}{'-' * 80}{RESET}")
-    print(f"{BOLD}{'GUEST UID':<15} | {'INGAME UID':<15} | {'REGION':<8} | {'STATUS':<15} | {'DETAILS'}{RESET}")
-    print(f"{BOLD}{'-' * 80}{RESET}")
-
+    completed_count = 0
     active_cnt = 0
     banned_cnt = 0
     invalid_cnt = 0
 
-    for r in results:
-        status = r["status"]
-        if status == "ACTIVE":
-            status_color = f"{GREEN}{status:<15}{RESET}"
-            active_cnt += 1
-        elif "BANNED" in status:
-            status_color = f"{RED}{status:<15}{RESET}"
-            banned_cnt += 1
-        else:
-            status_color = f"{YELLOW}{status:<15}{RESET}"
-            invalid_cnt += 1
+    results = []
+    active_list = []
+    banned_list = []
 
-        details = r.get("details", "")
-        print(f"{r['guest_uid']:<15} | {r['ingame_uid']:<15} | {r['region']:<8} | {status_color} | {details}")
+    lock = asyncio.Lock()
 
-    print(f"{BOLD}{'-' * 80}{RESET}\n")
-    print(f"{BOLD}SUMMARY:{RESET} Total: {len(results)} | {GREEN}Active: {active_cnt}{RESET} | {RED}Banned: {banned_cnt}{RESET} | {YELLOW}Invalid/Error: {invalid_cnt}{RESET}\n")
+    async def worker(u: str, p: str):
+        nonlocal completed_count, active_cnt, banned_cnt, invalid_cnt
+        res = await check_account(client, u, p, semaphore)
+        
+        async with lock:
+            completed_count += 1
+            idx = completed_count
+            status = res["status"]
+            
+            if status == "ACTIVE":
+                active_cnt += 1
+                status_str = f"{GREEN}ACTIVE{RESET}"
+                active_list.append(f"{u}:{p}")
+            elif "BANNED" in status:
+                banned_cnt += 1
+                status_str = f"{RED}BANNED{RESET}"
+                banned_list.append(f"{u}:{p}")
+            else:
+                invalid_cnt += 1
+                status_str = f"{YELLOW}{status[:12]}{RESET}"
 
-    output_json = "check_results.json"
-    with open(output_json, "w", encoding="utf-8") as f:
+            details = res.get("details", "")
+            print(f"[{idx:<4}/{total}] | {res['guest_uid']:<14} | {res['ingame_uid']:<14} | {res['region']:<7} | {status_str:<21} | {details}")
+            results.append(res)
+
+    tasks = [worker(u, p) for u, p in accounts]
+    await asyncio.gather(*tasks)
+    await client.aclose()
+
+    print(f"{BOLD}{'-' * 88}{RESET}")
+    print(f"\n{BOLD}CHECK COMPLETED!{RESET}")
+    print(f"Total: {total} | {GREEN}Active: {active_cnt}{RESET} | {RED}Banned: {banned_cnt}{RESET} | {YELLOW}Invalid/Error: {invalid_cnt}{RESET}\n")
+
+    # Export results
+    with open("check_results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
-    print(f"{GREEN}[✓] Full results saved to: {output_json}{RESET}\n")
+    print(f"{GREEN}[✓] Full JSON results saved to: check_results.json{RESET}")
+
+    if active_list:
+        with open("active_accounts.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(active_list) + "\n")
+        print(f"{GREEN}[✓] Active accounts saved to: active_accounts.txt ({len(active_list)} accounts){RESET}")
+
+    if banned_list:
+        with open("banned_accounts.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(banned_list) + "\n")
+        print(f"{RED}[✓] Banned accounts saved to: banned_accounts.txt ({len(banned_list)} accounts){RESET}")
+    print()
 
 if __name__ == "__main__":
     try:
